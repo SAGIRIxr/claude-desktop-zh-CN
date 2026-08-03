@@ -14,10 +14,10 @@
     zh-CN.json is never requested and never loads. The only approach that sticks
     is to overwrite a stock locale file that claude.ai actually asks for.
 
-    Default target is en-US: it needs no change to your account language, and
-    leaves the claude.ai web content in English (it cannot be Chinese either way).
-    Pick another with -TargetLocale if you prefer, but then you must also switch
-    the language in Claude's settings to match.
+    Default target is ja-JP. That leaves en-US untouched, so the app's own
+    language setting becomes a toggle: pick 日本語 for the Chinese shell, pick
+    English to get the stock English build back — no reinstall needed. Use
+    -TargetLocale en-US instead if you would rather not touch the setting at all.
 
     The original file is backed up outside the package before being replaced.
 
@@ -25,7 +25,7 @@
     Restores the original locale file from the backup.
 
 .PARAMETER TargetLocale
-    Which stock locale file to overwrite. Defaults to en-US.
+    Which stock locale file to overwrite. Defaults to ja-JP.
 
 .PARAMETER Restart
     Relaunch Claude Desktop when finished. Off by default.
@@ -42,7 +42,7 @@ param(
     [switch]$Uninstall,
     [switch]$Restart,
     [switch]$DryRun,
-    [string]$TargetLocale = 'en-US',
+    [string]$TargetLocale = 'ja-JP',
 
     # Internal: set when the script relaunches itself elevated.
     [switch]$Elevated,
@@ -578,7 +578,21 @@ Write-Host ""
 if ($Uninstall) {
     Write-Host "  卸载完成，已还原原始语言文件。" -ForegroundColor Green
 } else {
-    Write-Host "  安装完成。请手动启动 Claude Desktop 查看效果。" -ForegroundColor Green
+    Write-Host "  安装完成。请手动启动 Claude Desktop。" -ForegroundColor Green
+    Write-Host ""
+    if ($TargetLocale -ne 'en-US') {
+        # The shell only loads our file once claude.ai asks for this locale, and
+        # claude.ai only asks for what the account language says.
+        $display = switch ($TargetLocale) {
+            'ja-JP' { '日本語' }; 'ko-KR' { '한국어' }; 'de-DE' { 'Deutsch' }
+            'fr-FR' { 'Français' }; 'it-IT' { 'Italiano' }; 'pt-BR' { 'Português' }
+            'id-ID' { 'Bahasa Indonesia' }; 'hi-IN' { 'हिन्दी' }
+            default { $TargetLocale }
+        }
+        Write-Host "  最后一步：在 Claude 设置里把语言切换为「$display」" -ForegroundColor Cyan
+        Write-Host "  界面语言由 claude.ai 账号设置决定，不切换则不会生效。" -ForegroundColor Cyan
+        Write-Host "  想看回英文原版，把语言切回 English 即可（en-US.json 未被改动）。" -ForegroundColor DarkGray
+    }
     Write-Host "  注意：应用更新会替换安装目录，届时请重新运行本程序。" -ForegroundColor Yellow
 }
 exit 0

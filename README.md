@@ -2,7 +2,7 @@
 
 给 Claude Desktop (Windows) 加上简体中文界面。
 
-**不改 `app.asar`，不打补丁，不注入脚本。** 用中文语言包覆盖应用自带的 `en-US.json`，
+**不改 `app.asar`，不打补丁，不注入脚本。** 用中文语言包覆盖应用自带的 `ja-JP.json`，
 原文件备份在安装包外部，可随时还原。
 
 > 非官方项目，与 Anthropic 无关。翻译共 473 条，覆盖菜单、托盘、右键菜单与各类对话框。
@@ -17,11 +17,23 @@
 1. 下载本仓库（右上角 **Code → Download ZIP**），解压
 2. **双击 `install.bat`**
 3. 弹出 UAC 时点「是」
+4. 手动打开 Claude Desktop，**在设置里把语言切换为「日本語」**
+
+第 4 步不能省 —— 界面语言由 claude.ai 账号设置决定，不切换就不会加载我们的文件。
 
 卸载：双击 `uninstall.bat`。
 
 > 安装会关闭 Claude Desktop，请先保存正在进行的对话。
 > 安装完成后**不会自动启动**应用，需要你手动打开。
+
+### 想切回英文？
+
+把语言切回 **English** 就行 —— `en-US.json` 完全没被改动，是原版英文。
+所以装完之后，设置里的语言项等于一个**中英切换开关**，不需要卸载重装。
+
+代价是选「日本語」时，对话内容区（claude.ai 网页部分）会变成日文。
+如果你更在意这一点，可以改成覆盖英文：`install.ps1 -TargetLocale en-US`，
+这样完全不用动设置，网页内容保持英文，但也就没有一键切回原版的能力了。
 
 想先看看它打算做什么而不实际执行：
 
@@ -69,15 +81,15 @@ origin === "https://claude.com" || origin === "https://preview.claude.com"
 
 1. `zh-CN` 永远不会被请求，因为 claude.ai 的语言列表里没有简体中文
 2. 唯一可行的办法是**覆盖一个 claude.ai 确实会请求的语言文件**
-3. 默认选 `en-US`：不需要改账号语言设置，网页内容也维持英文（反正它变不成中文）
 
-| 覆盖目标 | 桌面外壳 | 网页内容 | 需要改账号语言 |
-|---|---|---|---|
-| `en-US`（默认） | 中文 | 英文 | 不需要 |
-| `ja-JP` 等 | 中文 | 该语言 | 需要，且网页会变成日文 |
+默认选 `ja-JP`，因为它把「语言设置」变成了中英切换开关：
 
-如果你偏要覆盖别的语言：`install.ps1 -TargetLocale ja-JP`，然后去 Claude 设置里
-把语言切成对应项。
+| 覆盖目标 | 账号语言选 | 桌面外壳 | 网页内容 | 能否一键切回原版 |
+|---|---|---|---|---|
+| **`ja-JP`（默认）** | 日本語 | 中文 | 日文 | **能**，切回 English 即可 |
+| `en-US` | English | 中文 | 英文 | 不能，需卸载 |
+
+用 `-TargetLocale` 指定其他语言也可以，脚本会在安装完成后提示你该切换到哪一项。
 
 ---
 
@@ -94,7 +106,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 1. 定位安装位置（MSIX 包或传统 Electron 安装都支持）
 2. 关闭 Claude Desktop —— 必须关掉，否则退出时会覆盖掉配置改动
 3. 若目录不可写则请求 UAC 提权，临时取得所有权（见下方风险说明）
-4. 把原始 `en-US.json` 备份到 `%LOCALAPPDATA%\claude-desktop-zh-CN\`
+4. 把原始 `ja-JP.json` 备份到 `%LOCALAPPDATA%\claude-desktop-zh-CN\`
 5. 用中文语言包覆盖它，并校验能被 `JSON.parse` 解析、条目数正常
 6. **还原目录的所有权和 ACL**（先 `/setowner` 再 `/remove:g`，顺序不能反）
 
@@ -103,7 +115,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 | 参数 | 说明 |
 |---|---|
 | `-DryRun` | 只打印计划，不做任何改动 |
-| `-TargetLocale <locale>` | 覆盖哪个语言文件，默认 `en-US` |
+| `-TargetLocale <locale>` | 覆盖哪个语言文件，默认 `ja-JP` |
 | `-Restart` | 完成后自动启动应用，默认不启动 |
 | `-Uninstall` | 还原 |
 
@@ -131,9 +143,11 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 
 **读之前先了解这几条，都是真实存在的代价：**
 
-- **会覆盖应用自带的 `en-US.json`。** 这是一个 Anthropic 签名包内的文件。原文件在覆盖前
-  备份到 `%LOCALAPPDATA%\claude-desktop-zh-CN\en-US.json.orig`，卸载即还原。
-  这比之前「只新增文件」的做法侵入性更强，但那种做法**根本不生效**（原因见上文）。
+- **会覆盖应用自带的 `ja-JP.json`。** 这是一个 Anthropic 签名包内的文件。原文件在覆盖前
+  备份到 `%LOCALAPPDATA%\claude-desktop-zh-CN\ja-JP.json.orig`，卸载即还原。
+  这比「只新增文件」的做法侵入性更强，但那种做法**根本不生效**（原因见上文）。
+  副作用是日语用户装了这个就没日语可用了 —— 如果你需要日语，改用 `-TargetLocale` 挑一个
+  你不用的语言。
 
 - **需要管理员权限，且要临时改 `C:\Program Files\WindowsApps` 的权限。**
   该目录属主是 `NT AUTHORITY\SYSTEM`，连 Administrators 组默认也只有只读。脚本用

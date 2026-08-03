@@ -8,7 +8,7 @@
 [CmdletBinding()]
 param(
     [switch]$Restart,
-    [string]$TargetLocale = 'en-US'
+    [string]$TargetLocale = 'ja-JP'
 )
 
 $ErrorActionPreference = 'Stop'
