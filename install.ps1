@@ -321,14 +321,21 @@ function Write-ProtectedFile($path, $content) {
         Invoke-Native -Exe 'icacls.exe' -Arguments @($path, '/remove:g', "*$($script:AdminsSid)") -IgnoreExitCode | Out-Null
         if ($origOwner) { Set-OwnerTo $path $origOwner | Out-Null }
 
+        # Compare against an untouched sibling locale file rather than the
+        # snapshot: that is the real ground truth for "stock", and it avoids
+        # false alarms from ACL reads taken mid-operation.
         $after = Get-AceSet $path
         $nowOwner = try { (Get-Acl -LiteralPath $path).Owner } catch { '<无法读取>' }
-        if (($before -join ';') -eq ($after -join ';') -and $nowOwner -eq $origOwner) {
+        $reference = Get-ChildItem (Split-Path $path -Parent) -Filter '*.json' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -ne $path } | Select-Object -First 1
+        $refAces = if ($reference) { Get-AceSet $reference.FullName } else { $before }
+
+        if (($refAces -join ';') -eq ($after -join ';') -and $nowOwner -eq $origOwner) {
             Write-Ok "文件权限已精确还原（属主：$nowOwner）"
         } else {
-            Write-Warn2 "文件权限未能完全还原：属主 $origOwner -> $nowOwner"
-            Write-Log "    [acl] before: $($before -join ' / ')"
-            Write-Log "    [acl] after : $($after -join ' / ')"
+            Write-Warn2 "文件权限可能未完全还原：属主 $origOwner -> $nowOwner"
+            Write-Log "    [acl] reference($($reference.Name)): $($refAces -join ' / ')"
+            Write-Log "    [acl] actual                       : $($after -join ' / ')"
         }
     }
 }
