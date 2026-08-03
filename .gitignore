@@ -1,0 +1,5 @@
+node_modules/
+*.log
+*.bak-zhcn
+.DS_Store
+Thumbs.db
