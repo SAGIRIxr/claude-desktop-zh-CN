@@ -2,10 +2,13 @@
 
 给 Claude Desktop (Windows) 加上简体中文界面。
 
-**不改 `app.asar`，不打补丁，不注入脚本。** 只往应用目录放一个 `zh-CN.json`，再把配置里的
-`locale` 改成 `zh-CN`。
+**不改 `app.asar`，不打补丁，不注入脚本。** 用中文语言包覆盖应用自带的 `en-US.json`，
+原文件备份在安装包外部，可随时还原。
 
-> 非官方项目，与 Anthropic 无关。翻译共 473 条，覆盖菜单、托盘、对话框与设置界面。
+> 非官方项目，与 Anthropic 无关。翻译共 473 条，覆盖菜单、托盘、右键菜单与各类对话框。
+
+**汉化范围**：桌面外壳（菜单栏、托盘、设置项、权限弹窗等）。
+对话内容区是 claude.ai 网页，由 Anthropic 服务端提供翻译，**无法汉化** —— 它没有简体中文。
 
 ---
 
@@ -17,52 +20,64 @@
 
 卸载：双击 `uninstall.bat`。
 
-就这些。脚本会自动定位安装位置、关闭应用、写入语言包、改配置、还原权限并重启 Claude。
+> 安装会关闭 Claude Desktop，请先保存正在进行的对话。
+> 安装完成后**不会自动启动**应用，需要你手动打开。
 
-> 安装过程会关闭 Claude Desktop，请先保存正在进行的对话。
+想先看看它打算做什么而不实际执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -DryRun
+```
 
 ---
 
 ## 原理
 
-Claude Desktop 自带完整的 i18n 系统（`resources/` 下已有 `en-US.json`、`ja-JP.json`、
-`de-DE.json` 等 11 个语言包），只是没发布中文。反编译主进程 bundle 后，相关逻辑是这样的：
+Claude Desktop 自带完整 i18n 系统（`resources/` 下有 `en-US.json`、`ja-JP.json` 等 11 个
+语言包），只是没发布中文。主进程逻辑：
 
 ```js
 // 语言包目录：打包后就是 process.resourcesPath
-function 语言包目录() {
-  return app.isPackaged ? process.resourcesPath : path.resolve(__dirname, "../../resources/i18n");
-}
+const 语言包目录 = () => app.isPackaged ? process.resourcesPath : ...;
 
-// 可用语言列表：扫描目录，凡是 xx-XX 命名的 .json 都算数
-function 可用语言() {
-  return fs.readdirSync(语言包目录())
-    .filter(n => /[a-z]{2}-[A-Z]{2}/.test(n))
-    .map(n => n.replace(/\.json$/, ""))
-    .reduce((acc, k) => (acc[k] = true, acc), {});
-}
+// 按文件名读取
+const 加载 = locale => createIntl({
+  locale,
+  messages: JSON.parse(fs.readFileSync(path.join(语言包目录(), `${locale}.json`), "utf8")),
+});
 
-// 加载：直接按文件名读取
-function 加载(locale) {
-  return createIntl({
-    locale,
-    messages: JSON.parse(fs.readFileSync(path.join(语言包目录(), `${locale}.json`), "utf8")),
-  });
-}
-
-// 启动时读 config.json 的 locale，缺省则按系统语言匹配
-loadLocale(store.get("locale", 按系统语言挑一个()));
+// 启动时从 electron-store 读 locale
+加载(store.get("locale", 按系统语言挑一个()));
 ```
 
-三个关键结论：
+看到这里很容易得出「新增一个 `zh-CN.json` 再把 config 改成 `zh-CN`」的结论 ——
+**这条路走不通**，实测会在启动约 30 秒后被打回英文。
 
-1. **没有硬编码的语言白名单。** 可用语言完全由目录扫描决定，`zh-CN.json` 天然合法。
-2. **语言由 `%APPDATA%\Claude\config.json` 的 `locale` 字段决定**，应用内没有语言选择 UI
-   （`en-US.json` 里没有任何 "Language" 相关字符串）。
-3. 主进程和渲染进程共用同一份语言包（渲染层通过 `DesktopIntl.getInitialLocale` IPC 拿），
-   所以一个文件就能覆盖菜单、托盘、对话框和界面。
+原因在 IPC 层。`DesktopIntl` 接口把 `requestLocaleChange` 暴露给渲染进程，
+并且主进程**自己从不调用它**；而 origin 白名单是：
 
-因此这个"插件"要做的只有两件事：放文件 + 改一行配置。
+```js
+origin === "https://claude.ai"  || origin === "https://preview.claude.ai" ||
+origin === "https://claude.com" || origin === "https://preview.claude.com"
+```
+
+也就是说 —— **语言的真正决定者是 claude.ai 网页端（你账号的语言设置）。**
+网页加载完成后会把账号语言下推给外壳，`store.set("locale", ...)` 覆盖本地配置。
+`config.json` 只是缓存，不是开关。
+
+所以：
+
+1. `zh-CN` 永远不会被请求，因为 claude.ai 的语言列表里没有简体中文
+2. 唯一可行的办法是**覆盖一个 claude.ai 确实会请求的语言文件**
+3. 默认选 `en-US`：不需要改账号语言设置，网页内容也维持英文（反正它变不成中文）
+
+| 覆盖目标 | 桌面外壳 | 网页内容 | 需要改账号语言 |
+|---|---|---|---|
+| `en-US`（默认） | 中文 | 英文 | 不需要 |
+| `ja-JP` 等 | 中文 | 该语言 | 需要，且网页会变成日文 |
+
+如果你偏要覆盖别的语言：`install.ps1 -TargetLocale ja-JP`，然后去 Claude 设置里
+把语言切成对应项。
 
 ---
 
@@ -77,12 +92,20 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 脚本会：
 
 1. 定位安装位置（MSIX 包或传统 Electron 安装都支持）
-2. 关闭 Claude Desktop —— **必须关掉**，否则退出时会把 `config.json` 写回去覆盖掉改动
+2. 关闭 Claude Desktop —— 必须关掉，否则退出时会覆盖掉配置改动
 3. 若目录不可写则请求 UAC 提权，临时取得所有权（见下方风险说明）
-4. 写入 `zh-CN.json`，并校验能被 `JSON.parse` 解析
-5. 备份 `config.json` 到 `config.json.bak-zhcn`，把 `locale` 改成 `zh-CN`
-6. **还原目录的所有权和 ACL**
-7. 重新启动 Claude Desktop
+4. 把原始 `en-US.json` 备份到 `%LOCALAPPDATA%\claude-desktop-zh-CN\`
+5. 用中文语言包覆盖它，并校验能被 `JSON.parse` 解析、条目数正常
+6. **还原目录的所有权和 ACL**（先 `/setowner` 再 `/remove:g`，顺序不能反）
+
+可用参数：
+
+| 参数 | 说明 |
+|---|---|
+| `-DryRun` | 只打印计划，不做任何改动 |
+| `-TargetLocale <locale>` | 覆盖哪个语言文件，默认 `en-US` |
+| `-Restart` | 完成后自动启动应用，默认不启动 |
+| `-Uninstall` | 还原 |
 
 卸载：
 
@@ -90,13 +113,17 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 ```
 
-删除 `zh-CN.json`，并从备份恢复原来的 `locale`。
+从 `%LOCALAPPDATA%\claude-desktop-zh-CN\` 还原原始语言文件。备份放在安装包外部，
+所以即使应用更新过也还在。
 
 ### 排错
 
 提权后的操作跑在一个独立的 UAC 窗口里，退出时会立刻关闭。脚本会把这一段的全部输出写到
 `%TEMP%\claude-zhcn-install-<时间戳>.log`，并在返回父进程后原样打印出来 —— 所以失败时直接看
-终端里 `--- elevated step ---` 那一段就够了，日志路径也会在提权前打印。
+终端里 `--- 提权步骤输出 ---` 那一段就够了，日志路径也会在提权前打印。
+
+日志里会记录每次调用 `takeown` / `icacls` 的**实际参数串和退出码**，
+路径引号、权限失败之类的问题一眼可见。
 
 ---
 
@@ -104,14 +131,23 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 
 **读之前先了解这几条，都是真实存在的代价：**
 
+- **会覆盖应用自带的 `en-US.json`。** 这是一个 Anthropic 签名包内的文件。原文件在覆盖前
+  备份到 `%LOCALAPPDATA%\claude-desktop-zh-CN\en-US.json.orig`，卸载即还原。
+  这比之前「只新增文件」的做法侵入性更强，但那种做法**根本不生效**（原因见上文）。
+
 - **需要管理员权限，且要临时改 `C:\Program Files\WindowsApps` 的权限。**
   该目录属主是 `NT AUTHORITY\SYSTEM`，连 Administrators 组默认也只有只读。脚本用
   `takeown` + `icacls` 临时授权，操作完成后在 `finally` 块里还原属主和 ACL。
+  还原属主需要 `SeRestorePrivilege`——提权令牌持有它但默认禁用，脚本会显式启用，
+  否则 `icacls /setowner` 会以「拒绝访问」失败、把目录属主留在 `BUILTIN\Administrators`。
   但凡不愿意动系统目录权限的，就别装。
 
 - **应用更新后会失效。** MSIX 更新会创建新的版本目录
-  （`Claude_<版本>_x64__pzs8sxrjxfjjc`），`zh-CN.json` 不会跟过去。届时界面会**自动回退到
-  英文**（`loadLocale` 失败时 fallback 到 en-US，不会崩），重新跑一次 `install.ps1` 即可。
+  （`Claude_<版本>_x64__pzs8sxrjxfjjc`），修改不会跟过去，界面回到英文。
+  重新跑一次 `install.ps1` 即可（备份在包外，不受影响）。
+
+- **对话内容区不会变中文。** 那部分是 claude.ai 网页，翻译由服务端下发，
+  而 Anthropic 没有提供简体中文。本项目只能汉化桌面外壳。
 
 - **MSIX 包完整性。** 这个包是 `SignatureKind: Developer` 的侧载包。脚本只**新增**文件，
   不修改任何已签名文件，是风险最低的改法；但 Windows 若触发包修复，新增文件仍可能被清掉。

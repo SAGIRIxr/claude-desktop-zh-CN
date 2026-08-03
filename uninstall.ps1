@@ -7,8 +7,8 @@
 #Requires -Version 5.1
 [CmdletBinding()]
 param(
-    [switch]$NoRestart,
-    [string]$Locale = 'zh-CN'
+    [switch]$Restart,
+    [string]$TargetLocale = 'en-US'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,6 +16,6 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $installer = Join-Path $here 'install.ps1'
 if (-not (Test-Path $installer)) { throw "install.ps1 not found next to this script" }
 
-$splat = @{ Uninstall = $true; Locale = $Locale }
-if ($NoRestart) { $splat['NoRestart'] = $true }
+$splat = @{ Uninstall = $true; TargetLocale = $TargetLocale }
+if ($Restart) { $splat['Restart'] = $true }
 & $installer @splat

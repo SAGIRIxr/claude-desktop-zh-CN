@@ -3,22 +3,32 @@
     Installs the Simplified Chinese language pack for Claude Desktop.
 
 .DESCRIPTION
-    Claude Desktop ships a built-in i18n system: the main process reads
-    "<resourcesPath>\<locale>.json" and discovers available locales by scanning
-    that directory for files matching /[a-z]{2}-[A-Z]{2}/. There is no hardcoded
-    allowlist, so dropping zh-CN.json in makes it a first-class locale.
+    Claude Desktop's main process loads "<resourcesPath>\<locale>.json" and picks
+    the locale from its electron-store config. That config is NOT the source of
+    truth: the remote claude.ai renderer is authorised (see the origin check on
+    the DesktopIntl IPC interface) to call requestLocaleChange, and it pushes the
+    account's language preference down a few seconds after launch, overwriting
+    whatever the config said.
 
-    This script therefore ADDS ONE FILE and FLIPS ONE SETTING. It never modifies
-    app.asar or any file shipped and signed by Anthropic.
+    Simplified Chinese is not in claude.ai's language list, so a freshly added
+    zh-CN.json is never requested and never loads. The only approach that sticks
+    is to overwrite a stock locale file that claude.ai actually asks for.
+
+    Default target is en-US: it needs no change to your account language, and
+    leaves the claude.ai web content in English (it cannot be Chinese either way).
+    Pick another with -TargetLocale if you prefer, but then you must also switch
+    the language in Claude's settings to match.
+
+    The original file is backed up outside the package before being replaced.
 
 .PARAMETER Uninstall
-    Removes zh-CN.json and restores the previous locale.
+    Restores the original locale file from the backup.
 
-.PARAMETER NoRestart
-    Do not relaunch Claude Desktop after applying changes.
+.PARAMETER TargetLocale
+    Which stock locale file to overwrite. Defaults to en-US.
 
-.PARAMETER Locale
-    Locale to switch to. Defaults to zh-CN.
+.PARAMETER Restart
+    Relaunch Claude Desktop when finished. Off by default.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\install.ps1
@@ -30,14 +40,16 @@
 [CmdletBinding()]
 param(
     [switch]$Uninstall,
-    [switch]$NoRestart,
-    [string]$Locale = 'zh-CN',
+    [switch]$Restart,
+    [switch]$DryRun,
+    [string]$TargetLocale = 'en-US',
 
     # Internal: set when the script relaunches itself elevated.
     [switch]$Elevated,
     [string]$ConfigPath,
     [string]$PayloadPath,
     [string]$ResourcePath,
+    [string]$BackupDir,
     [string]$LogPath
 )
 
@@ -185,6 +197,54 @@ function Test-DirWritable($dir) {
 # BUILTIN\Administrators
 $script:AdminsSid = 'S-1-5-32-544'
 
+<#
+    Handing ownership back to NT AUTHORITY\SYSTEM needs SeRestorePrivilege.
+    An elevated token *holds* it but it is disabled by default, so icacls
+    /setowner fails with "Access is denied" (exit 5) — which is exactly what
+    happened before this was added. Enable it explicitly on our own token.
+#>
+$script:PrivTypeLoaded = $false
+function Enable-Privilege([string]$Name) {
+    if (-not $script:PrivTypeLoaded) {
+        Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class ZhCnPriv {
+    [StructLayout(LayoutKind.Sequential)] public struct LUID { public uint LowPart; public int HighPart; }
+    [StructLayout(LayoutKind.Sequential)] public struct LUID_AND_ATTRIBUTES { public LUID Luid; public uint Attributes; }
+    [StructLayout(LayoutKind.Sequential)] public struct TOKEN_PRIVILEGES { public uint PrivilegeCount; public LUID_AND_ATTRIBUTES Privileges; }
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool OpenProcessToken(IntPtr h, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool LookupPrivilegeValue(string system, string name, out LUID luid);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TOKEN_PRIVILEGES newState, uint len, IntPtr prev, IntPtr retLen);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    public static bool Enable(string name) {
+        IntPtr token;
+        // TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY
+        if (!OpenProcessToken(GetCurrentProcess(), 0x0020 | 0x0008, out token)) return false;
+        try {
+            LUID luid;
+            if (!LookupPrivilegeValue(null, name, out luid)) return false;
+            TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES();
+            tp.PrivilegeCount = 1;
+            tp.Privileges.Luid = luid;
+            tp.Privileges.Attributes = 0x00000002; // SE_PRIVILEGE_ENABLED
+            if (!AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero)) return false;
+            return Marshal.GetLastWin32Error() == 0; // ERROR_NOT_ALL_ASSIGNED == 1300
+        } finally { CloseHandle(token); }
+    }
+}
+'@
+        $script:PrivTypeLoaded = $true
+    }
+    $ok = [ZhCnPriv]::Enable($Name)
+    Write-Log "    [privilege] $Name enabled=$ok"
+    return $ok
+}
+
 function Grant-TempWrite($dir) {
     $prevOwner = (Get-Acl -LiteralPath $dir).Owner
     Write-Warn2 "临时接管目录所有权：$dir（当前属主：$prevOwner）"
@@ -203,11 +263,31 @@ function Grant-TempWrite($dir) {
 }
 
 function Revoke-TempWrite($dir, $prevOwner) {
-    # Drop the explicit ACE we added; inherited ACEs are untouched.
-    Invoke-Native -Exe 'icacls.exe' -Arguments @($dir, '/remove:g', "*$($script:AdminsSid)") -IgnoreExitCode | Out-Null
+    # Order matters: hand ownership back FIRST, while we still hold the explicit
+    # Full Control ACE. Doing /remove:g first strips the rights needed to change
+    # the owner, which is how the folder previously ended up stuck on
+    # BUILTIN\Administrators.
     if ($prevOwner) {
+        Enable-Privilege 'SeRestorePrivilege' | Out-Null
+        Enable-Privilege 'SeTakeOwnershipPrivilege' | Out-Null
         Invoke-Native -Exe 'icacls.exe' -Arguments @($dir, '/setowner', $prevOwner) -IgnoreExitCode | Out-Null
+
+        # icacls can still refuse; the .NET path honours the privilege we just
+        # enabled and usually succeeds where it does not.
+        if ((Get-Acl -LiteralPath $dir).Owner -ne $prevOwner) {
+            try {
+                $acl = Get-Acl -LiteralPath $dir
+                $acl.SetOwner([System.Security.Principal.NTAccount]$prevOwner)
+                Set-Acl -LiteralPath $dir -AclObject $acl -ErrorAction Stop
+                Write-Log "    [setowner] fell back to .NET SetOwner"
+            } catch {
+                Write-Log "    [setowner] .NET fallback failed: $($_.Exception.Message)"
+            }
+        }
     }
+
+    # Then drop the explicit ACE we added; inherited ACEs are untouched.
+    Invoke-Native -Exe 'icacls.exe' -Arguments @($dir, '/remove:g', "*$($script:AdminsSid)") -IgnoreExitCode | Out-Null
     # Report what actually happened rather than what we asked for: /setowner
     # needs SeRestorePrivilege and can fail even elevated.
     $nowOwner = try { (Get-Acl -LiteralPath $dir).Owner } catch { '<无法读取>' }
@@ -313,6 +393,8 @@ if ($Elevated) {
     }
     $cfgPath = $ConfigPath
     $payload = $PayloadPath
+    # $BackupDir arrives from the parent so an admin account with a different
+    # profile still writes the backup where the invoking user can find it.
 } else {
     Write-Step "正在定位 Claude Desktop"
     $res = Find-ClaudeResources
@@ -325,13 +407,41 @@ if ($Elevated) {
     $cfgPath = Find-ConfigPath
     Write-Ok "配置文件：$cfgPath"
 
-    $payload = Join-Path $script:ScriptDir "src\$Locale.json"
+    $BackupDir = Join-Path $env:LOCALAPPDATA 'claude-desktop-zh-CN'
+    Write-Ok "备份目录：$BackupDir"
+    Write-Ok "覆盖目标：$TargetLocale.json"
+
+    $payload = Join-Path $script:ScriptDir 'src\zh-CN.json'
     if (-not $Uninstall -and -not (Test-Path $payload)) {
         throw "语言包不存在：$payload"
     }
 }
 
-$target = Join-Path $res.Path "$Locale.json"
+$target = Join-Path $res.Path "$TargetLocale.json"
+
+# Report the plan and stop before touching anything. Everything above this point
+# is read-only, so this is safe to run at any time.
+if ($DryRun) {
+    Write-Host ""
+    Write-Step "预演模式，以下操作不会执行"
+    $running = @(Get-Process -Name claude -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.StartsWith($res.Root, 'OrdinalIgnoreCase') }).Count
+    Write-Ok "会关闭的 Claude Desktop 进程数：$running"
+    Write-Ok "需要提权：$(-not (Test-DirWritable $res.Path))"
+    if ($Uninstall) {
+        Write-Ok "将从 $BackupDir 还原原始语言文件"
+    } else {
+        Write-Ok "将备份 $target"
+        Write-Ok "        -> $(Join-Path $BackupDir "$TargetLocale.json.orig")"
+        Write-Ok "将用 $payload 覆盖 $target"
+        $src = [System.IO.File]::ReadAllText($payload) | ConvertFrom-Json
+        Write-Ok "语言包字符串数：$(($src.PSObject.Properties | Measure-Object).Count)"
+    }
+    Write-Ok "安装后是否自动启动应用：$Restart"
+    Write-Host ""
+    Write-Host "  预演结束，未做任何更改。" -ForegroundColor Green
+    exit 0
+}
 
 # Claude rewrites config.json on exit, which would clobber our change.
 Stop-ClaudeDesktop $res.Root | Out-Null
@@ -346,14 +456,15 @@ if ($needsAcl -and -not (Test-Admin)) {
         '-NoProfile', '-ExecutionPolicy', 'Bypass',
         '-File', "`"$($MyInvocation.MyCommand.Path)`"",
         '-Elevated',
-        '-Locale', $Locale,
+        '-TargetLocale', $TargetLocale,
         '-ConfigPath', "`"$cfgPath`"",
         '-ResourcePath', "`"$($res.Path)`"",
         '-PayloadPath', "`"$payload`"",
+        '-BackupDir', "`"$BackupDir`"",
         '-LogPath', "`"$childLog`""
     )
     if ($Uninstall) { $argList += '-Uninstall' }
-    if ($NoRestart) { $argList += '-NoRestart' }
+    if ($Restart) { $argList += '-Restart' }
 
     Write-Ok "日志：$childLog"
     $p = Start-Process powershell.exe -Verb RunAs -ArgumentList $argList -PassThru -Wait
@@ -373,54 +484,101 @@ if ($needsAcl -and -not (Test-Admin)) {
     exit 0
 }
 
+$statePath = Join-Path $BackupDir 'state.json'
 $prevOwner = $null
 try {
     if ($needsAcl) { $prevOwner = Grant-TempWrite $res.Path }
 
     if ($Uninstall) {
-        Write-Step "正在移除语言包"
-        if (Test-Path $target) {
-            Remove-Item $target -Force
-            Write-Ok "已删除 $target"
+        Write-Step "正在还原原始语言文件"
+
+        if (-not (Test-Path $statePath)) {
+            Write-Warn2 "找不到安装记录 $statePath，无法自动还原"
+            Write-Warn2 "若界面异常，重装 Claude Desktop 即可恢复出厂语言文件"
         } else {
-            Write-Warn2 "$target 不存在，跳过"
+            $state = [System.IO.File]::ReadAllText($statePath) | ConvertFrom-Json
+            $orig = Join-Path $BackupDir "$($state.targetLocale).json.orig"
+            $dest = Join-Path $res.Path "$($state.targetLocale).json"
+            if (Test-Path $orig) {
+                Write-Utf8NoBom $dest ([System.IO.File]::ReadAllText($orig))
+                Write-Ok "已还原 $dest"
+                Remove-Item $orig -Force
+            } else {
+                Write-Warn2 "备份文件缺失：$orig"
+            }
+            Remove-Item $statePath -Force
         }
 
-        $backup = "$cfgPath.bak-zhcn"
-        if (Test-Path $backup) {
-            $prev = ([System.IO.File]::ReadAllText($backup) | ConvertFrom-Json).locale
+        # Clean up the stray zh-CN.json that earlier versions of this script left
+        # behind. It was never loaded, but there is no reason to leave it there.
+        $stray = Join-Path $res.Path 'zh-CN.json'
+        if (Test-Path $stray) {
+            Remove-Item $stray -Force
+            Write-Ok "已清理无效的 zh-CN.json"
+        }
+
+        $cfgBak = "$cfgPath.bak-zhcn"
+        if (Test-Path $cfgBak) {
+            $prev = ([System.IO.File]::ReadAllText($cfgBak) | ConvertFrom-Json).locale
             if (-not $prev) { $prev = 'en-US' }
             Set-ConfigLocale $cfgPath $prev | Out-Null
-            Remove-Item $backup -Force
-        } else {
-            Set-ConfigLocale $cfgPath 'en-US' | Out-Null
+            Remove-Item $cfgBak -Force
         }
     } else {
-        Write-Step "正在安装语言包"
+        Write-Step "正在安装语言包（覆盖 $TargetLocale）"
+
+        if (-not (Test-Path $target)) {
+            throw "目标语言文件不存在：$target"
+        }
+
+        if (-not (Test-Path $BackupDir)) { New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null }
+        $orig = Join-Path $BackupDir "$TargetLocale.json.orig"
+
+        # Only capture a backup the first time, so re-running after an app update
+        # never overwrites the pristine copy with our own translated file.
+        if (-not (Test-Path $orig)) {
+            Write-Utf8NoBom $orig ([System.IO.File]::ReadAllText($target))
+            Write-Ok "已备份原始 $TargetLocale.json 到 $orig"
+        } else {
+            Write-Ok "沿用已有备份 $orig"
+        }
+
         # Normalise to UTF-8 without BOM regardless of how the source was saved.
         Write-Utf8NoBom $target ([System.IO.File]::ReadAllText($payload))
         Write-Ok "已写入 $target"
 
         # Sanity check: the app will readFileSync + JSON.parse this file.
         $check = [System.IO.File]::ReadAllText($target) | ConvertFrom-Json
-        Write-Ok "校验通过：$(($check.PSObject.Properties | Measure-Object).Count) 条字符串可被正常解析"
+        $n = ($check.PSObject.Properties | Measure-Object).Count
+        Write-Ok "校验通过：$n 条字符串可被正常解析"
+        if ($n -lt 400) { throw "字符串数量异常（$n），安装中止" }
 
-        Set-ConfigLocale $cfgPath $Locale | Out-Null
+        @{
+            targetLocale = $TargetLocale
+            appVersion   = $res.Version
+            resourcePath = $res.Path
+            installedAt  = (Get-Date).ToString('s')
+        } | ConvertTo-Json | ForEach-Object { Write-Utf8NoBom $statePath $_ }
+
+        # Nudge the cached locale to match; claude.ai will confirm it on launch.
+        Set-ConfigLocale $cfgPath $TargetLocale | Out-Null
     }
 } finally {
     if ($needsAcl -and $prevOwner) { Revoke-TempWrite $res.Path $prevOwner }
 }
 
-if (-not $NoRestart) {
+# Off by default: relaunching immediately makes it harder to tell whether the
+# change took, and the caller may want to inspect things first.
+if ($Restart) {
     Write-Step "正在重新启动 Claude Desktop"
     if (Start-ClaudeDesktop $res) { Write-Ok "已启动" } else { Write-Warn2 "无法自动启动，请手动打开" }
 }
 
 Write-Host ""
 if ($Uninstall) {
-    Write-Host "  卸载完成，Claude Desktop 已恢复英文界面。" -ForegroundColor Green
+    Write-Host "  卸载完成，已还原原始语言文件。" -ForegroundColor Green
 } else {
-    Write-Host "  安装完成，Claude Desktop 已切换为简体中文。" -ForegroundColor Green
+    Write-Host "  安装完成。请手动启动 Claude Desktop 查看效果。" -ForegroundColor Green
     Write-Host "  注意：应用更新会替换安装目录，届时请重新运行本程序。" -ForegroundColor Yellow
 }
 exit 0
