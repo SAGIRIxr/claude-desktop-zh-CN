@@ -74,21 +74,34 @@ trap {
     stderr, so this cost us a working installer. Redirect at the OS level
     instead and judge success by exit code alone.
 #>
+# Start-Process joins -ArgumentList with plain spaces and quotes nothing, so any
+# argument containing a space (C:\Program Files\..., "NT AUTHORITY\SYSTEM")
+# silently splits into two. Quote per CommandLineToArgvW rules before handing off.
+function ConvertTo-NativeArg([string]$a) {
+    if ($null -eq $a -or $a -eq '') { return '""' }
+    if ($a -notmatch '[\s"]') { return $a }
+    # Double any backslashes that precede a quote, and any trailing run of them.
+    $e = [regex]::Replace($a, '(\\*)"', '$1$1\"')
+    $e = [regex]::Replace($e, '(\\+)$', '$1$1')
+    return '"' + $e + '"'
+}
+
 function Invoke-Native {
     param(
         [Parameter(Mandatory)][string]$Exe,
         [string[]]$Arguments = @(),
         [switch]$IgnoreExitCode
     )
+    $quoted = @($Arguments | ForEach-Object { ConvertTo-NativeArg $_ })
     $outFile = [System.IO.Path]::GetTempFileName()
     $errFile = [System.IO.Path]::GetTempFileName()
     try {
-        $proc = Start-Process -FilePath $Exe -ArgumentList $Arguments -NoNewWindow -Wait -PassThru `
+        $proc = Start-Process -FilePath $Exe -ArgumentList $quoted -NoNewWindow -Wait -PassThru `
             -RedirectStandardOutput $outFile -RedirectStandardError $errFile
         $so = (Get-Content -LiteralPath $outFile -Raw -ErrorAction SilentlyContinue)
         $se = (Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
 
-        Write-Log "    [$Exe $($Arguments -join ' ')] exit=$($proc.ExitCode)"
+        Write-Log "    [$Exe $($quoted -join ' ')] exit=$($proc.ExitCode)"
         if ($so) { Write-Log "      out: $($so.Trim())" }
         if ($se) { Write-Log "      err: $($se.Trim())" }
 
@@ -195,11 +208,20 @@ function Revoke-TempWrite($dir, $prevOwner) {
     if ($prevOwner) {
         Invoke-Native -Exe 'icacls.exe' -Arguments @($dir, '/setowner', $prevOwner) -IgnoreExitCode | Out-Null
     }
+    # Report what actually happened rather than what we asked for: /setowner
+    # needs SeRestorePrivilege and can fail even elevated.
+    $nowOwner = try { (Get-Acl -LiteralPath $dir).Owner } catch { '<无法读取>' }
     $stillWritable = Test-DirWritable $dir
+
+    if ($nowOwner -ne $prevOwner) {
+        Write-Warn2 "警告：属主未能还原（当前 $nowOwner，原为 $prevOwner）"
+        Write-Warn2 "可手动还原： icacls `"$dir`" /setowner `"$prevOwner`""
+    }
     if ($stillWritable) {
-        Write-Warn2 "警告：$dir 仍可写，权限可能未完全还原"
-    } else {
-        Write-Ok "已还原原始权限与属主（属主：$prevOwner）"
+        Write-Warn2 "警告：$dir 仍可写，附加的权限项可能未完全移除"
+    }
+    if ($nowOwner -eq $prevOwner -and -not $stillWritable) {
+        Write-Ok "已还原原始权限与属主（属主：$nowOwner）"
     }
 }
 
