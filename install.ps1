@@ -245,9 +245,107 @@ public static class ZhCnPriv {
     return $ok
 }
 
+function Get-AceSet($path) {
+    try {
+        return @((Get-Acl -LiteralPath $path).Access |
+            ForEach-Object { "$($_.IdentityReference)|$($_.FileSystemRights)|$($_.AccessControlType)" }) | Sort-Object
+    } catch { return @() }
+}
+
+# Reassigning an object to SYSTEM/TrustedInstaller needs SeRestorePrivilege.
+function Set-OwnerTo($path, $owner) {
+    if (-not $owner) { return $false }
+    Enable-Privilege 'SeRestorePrivilege' | Out-Null
+    Enable-Privilege 'SeTakeOwnershipPrivilege' | Out-Null
+
+    Invoke-Native -Exe 'icacls.exe' -Arguments @($path, '/setowner', $owner) -IgnoreExitCode | Out-Null
+    if ((Get-Acl -LiteralPath $path).Owner -eq $owner) { return $true }
+
+    # icacls can still refuse; the .NET path honours the privilege we enabled.
+    try {
+        $acl = Get-Acl -LiteralPath $path
+        $acl.SetOwner([System.Security.Principal.NTAccount]$owner)
+        Set-Acl -LiteralPath $path -AclObject $acl -ErrorAction Stop
+        Write-Log "    [setowner] $path -> $owner (.NET fallback)"
+    } catch {
+        Write-Log "    [setowner] $path -> $owner FAILED: $($_.Exception.Message)"
+        return $false
+    }
+    return ((Get-Acl -LiteralPath $path).Owner -eq $owner)
+}
+
+<#
+    Writes a file inside the package.
+
+    Full Control on the *directory* is not enough to overwrite a file that is
+    already there. Package files are owned by SYSTEM and their DACL grants
+    Administrators nothing, and the inheritable ACE we add to the directory
+    never reaches them: propagating an inherited ACE requires WRITE_DAC on each
+    child, which we do not have. Deleting instead of overwriting does not help
+    either — that is refused for the same reason.
+
+    So take ownership of the target file itself, grant, write, then put it back.
+    Package locale files carry no explicit ACEs (AreAccessRulesProtected is
+    false — everything is inherited), so removing the one ACE we add restores
+    the stock ACL exactly.
+#>
+function Write-ProtectedFile($path, $content) {
+    try {
+        Write-Utf8NoBom $path $content
+        Write-Log "    [write] $path (直接覆盖)"
+        return
+    } catch [System.UnauthorizedAccessException] {
+        Write-Log "    [write] 直接覆盖被拒绝，改为接管该文件"
+    }
+
+    $acl0 = Get-Acl -LiteralPath $path
+    $origOwner = $acl0.Owner
+    $before = Get-AceSet $path
+
+    # /remove:g strips every granted ACE for the principal, so it is only safe
+    # when the principal has none to begin with. Package locale files list
+    # Users/SYSTEM/TrustedInstaller and no Administrators entry, which is the
+    # case this relies on — verified against the restored ACL further down.
+    if (@($before | Where-Object { $_ -match 'Administrators' }).Count -gt 0) {
+        Write-Warn2 "注意：$path 已存在 Administrators 权限项，还原后可能与出厂不一致"
+    }
+
+    Invoke-Native -Exe 'takeown.exe' -Arguments @('/F', $path, '/A') -IgnoreExitCode | Out-Null
+    Invoke-Native -Exe 'icacls.exe' -Arguments @($path, '/grant', "*$($script:AdminsSid):F") | Out-Null
+
+    try {
+        Write-Utf8NoBom $path $content
+        Write-Log "    [write] $path (接管文件后覆盖)"
+    } finally {
+        # Drop our explicit ACE and hand the file back, even if the write failed.
+        Invoke-Native -Exe 'icacls.exe' -Arguments @($path, '/remove:g', "*$($script:AdminsSid)") -IgnoreExitCode | Out-Null
+        if ($origOwner) { Set-OwnerTo $path $origOwner | Out-Null }
+
+        $after = Get-AceSet $path
+        $nowOwner = try { (Get-Acl -LiteralPath $path).Owner } catch { '<无法读取>' }
+        if (($before -join ';') -eq ($after -join ';') -and $nowOwner -eq $origOwner) {
+            Write-Ok "文件权限已精确还原（属主：$nowOwner）"
+        } else {
+            Write-Warn2 "文件权限未能完全还原：属主 $origOwner -> $nowOwner"
+            Write-Log "    [acl] before: $($before -join ' / ')"
+            Write-Log "    [acl] after : $($after -join ' / ')"
+        }
+    }
+}
+
 function Grant-TempWrite($dir) {
     $prevOwner = (Get-Acl -LiteralPath $dir).Owner
-    Write-Warn2 "临时接管目录所有权：$dir（当前属主：$prevOwner）"
+
+    # BUILTIN\Administrators is never the stock owner of a WindowsApps package
+    # directory; seeing it means an earlier run failed to hand ownership back.
+    # Restoring "what we found" would make that permanent, so correct it.
+    if ($prevOwner -eq 'BUILTIN\Administrators' -and $dir -like '*\WindowsApps\*') {
+        Write-Warn2 "检测到目录属主为 BUILTIN\Administrators，这不是 WindowsApps 的出厂值"
+        Write-Warn2 "（应为 NT AUTHORITY\SYSTEM，多半是先前失败残留），本次将按出厂值还原"
+        $prevOwner = 'NT AUTHORITY\SYSTEM'
+    }
+
+    Write-Warn2 "临时接管目录所有权：$dir（还原目标属主：$prevOwner）"
 
     # takeown reports "SUCCESS" on stdout but also chatters on stderr; only the
     # exit code is meaningful. Tolerate a non-zero code here and let the
@@ -267,24 +365,7 @@ function Revoke-TempWrite($dir, $prevOwner) {
     # Full Control ACE. Doing /remove:g first strips the rights needed to change
     # the owner, which is how the folder previously ended up stuck on
     # BUILTIN\Administrators.
-    if ($prevOwner) {
-        Enable-Privilege 'SeRestorePrivilege' | Out-Null
-        Enable-Privilege 'SeTakeOwnershipPrivilege' | Out-Null
-        Invoke-Native -Exe 'icacls.exe' -Arguments @($dir, '/setowner', $prevOwner) -IgnoreExitCode | Out-Null
-
-        # icacls can still refuse; the .NET path honours the privilege we just
-        # enabled and usually succeeds where it does not.
-        if ((Get-Acl -LiteralPath $dir).Owner -ne $prevOwner) {
-            try {
-                $acl = Get-Acl -LiteralPath $dir
-                $acl.SetOwner([System.Security.Principal.NTAccount]$prevOwner)
-                Set-Acl -LiteralPath $dir -AclObject $acl -ErrorAction Stop
-                Write-Log "    [setowner] fell back to .NET SetOwner"
-            } catch {
-                Write-Log "    [setowner] .NET fallback failed: $($_.Exception.Message)"
-            }
-        }
-    }
+    if ($prevOwner) { Set-OwnerTo $dir $prevOwner | Out-Null }
 
     # Then drop the explicit ACE we added; inherited ACEs are untouched.
     Invoke-Native -Exe 'icacls.exe' -Arguments @($dir, '/remove:g', "*$($script:AdminsSid)") -IgnoreExitCode | Out-Null
@@ -500,7 +581,7 @@ try {
             $orig = Join-Path $BackupDir "$($state.targetLocale).json.orig"
             $dest = Join-Path $res.Path "$($state.targetLocale).json"
             if (Test-Path $orig) {
-                Write-Utf8NoBom $dest ([System.IO.File]::ReadAllText($orig))
+                Write-ProtectedFile $dest ([System.IO.File]::ReadAllText($orig))
                 Write-Ok "已还原 $dest"
                 Remove-Item $orig -Force
             } else {
@@ -543,8 +624,15 @@ try {
             Write-Ok "沿用已有备份 $orig"
         }
 
+        # Guard the delete-and-recreate path: never destroy the stock file
+        # unless a readable, parseable backup is already on disk.
+        $verify = [System.IO.File]::ReadAllText($orig) | ConvertFrom-Json
+        if (($verify.PSObject.Properties | Measure-Object).Count -lt 400) {
+            throw "备份文件校验失败，安装中止：$orig"
+        }
+
         # Normalise to UTF-8 without BOM regardless of how the source was saved.
-        Write-Utf8NoBom $target ([System.IO.File]::ReadAllText($payload))
+        Write-ProtectedFile $target ([System.IO.File]::ReadAllText($payload))
         Write-Ok "已写入 $target"
 
         # Sanity check: the app will readFileSync + JSON.parse this file.
